@@ -1,0 +1,10 @@
+extlib
+blib
+pm_to_blib
+MANIFEST
+Makefile
+MyMETA*
+META*
+inc/
+Net-GrowthForecast-*.tar.gz
+*~
