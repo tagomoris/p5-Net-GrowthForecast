@@ -9,6 +9,7 @@ requires 'Web::Query';
 requires 'LWP::UserAgent';
 
 requires 'Try::Tiny';
+requires 'Log::Minimal';
 
 build_requires 'Test::More';
 

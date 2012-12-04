@@ -1,0 +1,480 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use English;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use lib "$FindBin::Bin/../extlib/lib/perl5";
+
+use List::Util qw();
+
+use YAML qw();
+
+use Net::GrowthForecast;
+
+my $DEFAULT_LOGLEVEL = 'INFO';
+
+use Getopt::Long qw(:config posix_default no_ignore_case gnu_compat);
+
+# gfclient senario_file.yaml target_name arg1 arg2 ...
+#     not to do any create/edit operations (dry-run)
+# gfclient -f senario_file.yaml target_name arg1
+#     edit/create graphs
+
+my $opt = {};
+GetOptions($opt,
+           qw(
+                 help|h quiet|q verbose|v force|f
+         ));
+use Pod::Usage;
+pod2usage(1) if $opt->{help};
+
+my $LOGLEVEL = $DEFAULT_LOGLEVEL;
+if ($opt->{quiet}) { $LOGLEVEL = 'WARN'; }
+if ($opt->{verbose}) { $LOGLEVEL = 'DEBUG'; $ENV{LM_DEBUG} = 1; }
+
+my $FORCE = $opt->{force};
+
+use Log::Minimal;
+$Log::Minimal::LOG_LEVEL = $LOGLEVEL;
+$Log::Minimal::AUTODUMP = 1;
+$Log::Minimal::PRINT = sub {
+    my ( $time, $type, $message, $trace, $raw_message) = @_;
+    if ( $type eq 'INFO' or $type eq 'WARN' ) {
+        print "$time [$type] ($PID) $message\n";
+    } else {
+        print "$time [$type] ($PID) $message at $trace\n";
+    }
+};
+$Log::Minimal::DIE = sub {
+    my ( $time, $type, $message, $trace, $raw_message) = @_;
+    die "$time [$type] ($PID) $message at $trace\n";
+};
+
+my ($yaml_path, $target_name, @arguments) = @ARGV;
+
+my $senario = YAML::LoadFile($yaml_path);
+die 'Failed to load senario file path:' . $yaml_path unless $senario and $senario->{targets};
+die 'Specified target name not found in senario file:' . $target_name unless $senario->{targets}->{$target_name};
+
+sub main {
+    my $client = Net::GrowthForecast->new(%{$senario->{config}});
+    my $target = $senario->{targets}->{$target_name};
+    my $conv_map = generate_args_map($target, @arguments);
+
+    my $has_error = 0;
+    if ($target->{check}) {
+        # to check, all specs should be checked.
+        $has_error ||= List::Util::reduce { check_graph($client, $conv_map, $b) || $a } 0, @{$target->{check}};
+    }
+    if ($target->{create}) {
+        if ($FORCE) {
+            debugf "check and create graphs...";
+            # to create, specs after failure should be passed.
+            $has_error ||= List::Util::reduce { $a || create_graph($client, $conv_map, $b) } 0, @{$target->{create}};
+        } else {
+            infof "Now in dry-run mode. To create graphs, re-run with --force option.";
+            $has_error ||= List::Util::reduce { check_graph($client, $conv_map, $b) || $a } 0, @{$target->{create}};
+        }
+    }
+    return (not $has_error);
+}
+
+sub convert_args {
+    my ($map, $str) = @_;
+    my $target = "$str";
+    foreach my $pair (@$map) {
+        my $offset = 0;
+        my ($pattern, $replacement) = @$pair;
+        while((my $pos = index($target, $pattern, $offset)) > -1) {
+            substr($target, $pos, length($pattern), $replacement);
+            $offset = $pos + length($pattern);
+        }
+    }
+    return $target;
+}
+
+sub generate_args_map {
+    my ($target, @args) = @_;
+    my @arg_names = @{$target->{args}};
+    if (scalar(@arg_names) != scalar(@args)) {
+        die "Arguments from command line doesn't match with target's args: " . scalar(@arg_names);
+    }
+    my $map = [];
+    for(my $i = 0 ; $i < scalar(@args) ; $i++) {
+        push @$map, ['${' . $arg_names[$i] . '}', $args[$i]]
+    }
+    return $map;
+}
+
+sub parse_path {
+    my ($path, $map) = @_;
+    split(m!/!, convert_args($map, $path));
+}
+
+my $graph_cache = {}; # service -> section -> graphname
+sub get_graph {
+    my ($client, $service, $section, $name) = @_;
+
+    $graph_cache->{$service} ||= {};
+    $graph_cache->{$service}->{$section} ||= {};
+
+    unless ($graph_cache->{$service}->{$section}->{$name}) {
+        my $graphs = $client->graphs($service, $section);
+        foreach my $g (@$graphs) {
+            $graph_cache->{$g->{service}} ||= {};
+            $graph_cache->{$g->{service}}->{$g->{section}} ||= {};
+            $graph_cache->{$g->{service}}->{$g->{section}}->{$g->{name}} = $g;
+        }
+    }
+    debugf "get graph: %s", $graph_cache->{$service}->{$section}->{$name};
+    $graph_cache->{$service}->{$section}->{$name};
+}
+sub get_graph_info {
+    my ($client, $service, $section, $name) = @_;
+    my $graph = get_graph($client, $service, $section, $name);
+    return undef unless $graph;
+    unless ($graph->{description}) { # maybe without info
+        debugf "get info: %s/%s/%s", $service, $section, $name;
+        $graph = $graph_cache->{$service}->{$section}->{$name} = $client->info($graph);
+    }
+    $graph;
+}
+
+sub check_param {
+    my ($path, $param, $spec, $graph) = @_;
+    return undef if not defined($spec->{$param}) or $spec->{$param} eq $graph->{$param};
+    infof "mismatch: %s (%s), spec:%s, actual:%s", $path, $param, $spec->{$param}, $graph->{$param};
+    return 1;
+}
+
+my @BASIC_GRAPH_PARAMS = qw(sort gmode color type llimit ulimit stype sllimit sulimit);
+my @COMPLEX_GRAPH_PARAMS = qw(sumup sort);
+sub check_graph {
+    my ($client, $conv_map, $spec) = @_;
+    my $raw_path = delete $spec->{path};
+    unless ($raw_path) {
+        die "check target without 'path'";
+    }
+    my $path = convert_args($conv_map, $raw_path);
+    my @parsed_path = parse_path($path, $conv_map);
+    if (scalar(keys %$spec) < 1) { # 'path' existence check only
+        my $graph = get_graph($client, @parsed_path);
+        unless ($graph) {
+            infof "missing graph: %s", $path;
+            return 1;
+        }
+        return undef;
+    }
+
+    my $info = get_graph_info($client, @parsed_path);
+    unless ($info) {
+        infof "missing graph: %s", $path;
+        return 1;
+    }
+
+    my $has_error = 0;
+
+    if ($spec->{description}) { # description through conv
+        my $spec_desc = convert_args($conv_map, $spec->{description});
+        if ($spec_desc ne $info->{description}) {
+            infof "mismatch: %s (description), spec:%s, actual:%s", $path, $spec_desc, $info->{description};
+            $has_error = 1;
+        }
+    }
+
+    my @params;
+    my $additional;
+    if ($spec->{complex}) {
+        @params = @COMPLEX_GRAPH_PARAMS;
+        $additional = sub {
+            my ($path, $spec, $graph) = @_;
+            # subgraph num check
+            if (scalar(@{$graph->{series}}) != scalar(@{$spec->{series}})) {
+                infof "mismatch: %s (series num), spec:%s, actual:%s", $path, scalar(@{$spec->{series}}), scalar(@{$graph->{series}});
+                return 1;
+            }
+            my $rule = $spec->{rule} || {};
+            my @spec_series = ();
+            foreach my $s (@{$spec->{series}}) {
+                unless ($s->{path}) {
+                    infof "invalid: %s (series), subgraph 'path' doesn't exists";
+                    return 1;
+                }
+                my $subgraph = get_graph($client, parse_path(convert_args($conv_map, $s->{path})));
+                push @spec_series, +{ %$rule, %$s, id => $subgraph->{id} };
+            }
+            my $has_diff = 0;
+            for (my $i = 0 ; $i < scalar(@spec_series) ; $i++) {
+                my $s = $spec_series[$i];
+                my $a = $graph->{series}->[$i];
+                unless ($s->{id} == $a->{id}) {
+                    infof "mismatch: %s (series %d), subgraph spec path:%s (id %d), but is not actually.", $path, $i, convert_args($conv_map, $s->{path}), $s->{id};
+                    $has_diff = 1;
+                    next;
+                }
+                foreach my $attr ('type', 'gmode', 'stack') {
+                    next if $attr eq 'stack' and $i == 0; # first sub graph doesn't have 'stack' option
+                    if (defined $s->{$attr}) {
+                        my $val = $a->{$attr};
+                        $val = $a->{$attr} ? 'true' : 'false' if $attr eq 'stack';
+                        if ($s->{$attr} ne $val) {
+                            infof "mismatch: %s (series %d '%s'), spec:%s, actual:%s", $path, $i, $attr, $s->{$attr}, $a->{$attr};
+                            $has_diff = 1;
+                        }
+                    }
+                }
+            }
+            return 1 if $has_diff;
+            return undef;
+        };
+    } else {
+        @params = @BASIC_GRAPH_PARAMS;
+        $additional = sub {
+            my ($path, $spec, $graph) = @_;
+            # adjust => [adjust, adjustval, unit]
+            return undef unless $spec->{adjust};
+            my $sadjust = $spec->{adjust};
+            my $gadjust = $graph->{adjust};
+            if ($sadjust->[0] ne $gadjust->[0] or $sadjust->[1] ne $gadjust->[1] or $sadjust->[2] ne $gadjust->[2]) {
+                infof "mismatch: %s (adjust), spec:%s, actual:%s", $path, $sadjust, $gadjust;
+                return 1;
+            }
+            undef;
+        };
+    }
+    my $error = List::Util::reduce { check_param($path, $b, $spec, $info) || $a } 0, @params;
+    $error = $additional->($path, $spec, $info) || $error;
+    return $error;
+}
+
+sub create_basic_actual {
+    my ($client, $conv_map, $service, $section, $name, $spec) = @_;
+    my $create_spec = +{ service => $service, section => $section, name => $name };
+    if (defined $spec->{color}) {
+        $create_spec->{color} = delete $spec->{color};
+    }
+    my $result = $client->add($create_spec);
+    unless ($result) {
+        warnf "failed to create graph with spec:%s", $create_spec;
+        return 1;
+    }
+    return undef;
+}
+
+sub create_complex_actual {
+    my ($client, $conv_map, $service, $section, $name, $spec) = @_;
+    my $create_spec = +{ service => $service, section => $section, name => $name };
+    $create_spec->{complex} = 1;
+    $create_spec->{description} = convert_args($conv_map, $spec->{description}) if defined $spec->{description};
+    $create_spec->{sumup} = ($spec->{sumup} eq 'true' ? 1 : 0) if defined $spec->{sumup};
+    $create_spec->{sort} = $spec->{sort} if defined $spec->{sort};
+
+    if (scalar(@{$spec->{series}}) < 1) {
+        croakf "No 'series' sub-graph exists for complex graph:%s/%s/%s", $service, $section, $name;
+    }
+    foreach my $subgraph_spec (@{$spec->{series}}) {
+        unless ($subgraph_spec->{path}) {
+            croakf "'path' missing for series of complex graph:%s/%s/%s", $service, $section, $name;
+        }
+    }
+    my $base_rule = $spec->{rule};
+    my @series = ();
+    foreach my $s (@{$spec->{series}}) {
+        my $path = delete $s->{path};
+        my $subgraph = get_graph($client, parse_path(convert_args($conv_map,$path)));
+        unless ($subgraph) {
+            croakf "Sub graph '%s' not found for complex graph:%s/%s/%s", $path, $service, $section, $name;
+        }
+        push @series, +{ %$base_rule, %$s, id => $subgraph->{id} };
+    }
+    if ($series[0]->{stack}) {
+        delete $series[0]->{stack};
+    }
+    $create_spec->{series} = [@series];
+
+    my $result = $client->add($create_spec);
+    unless ($result) {
+        warnf "failed to create complex graph with spec:%s", $create_spec;
+        return 1;
+    }
+    return undef;
+}
+
+sub create_graph {
+    my ($client, $conv_map, $spec) = @_;
+
+    my $raw_path = delete $spec->{path};
+    unless ($raw_path) {
+        croakf "check target without 'path'";
+    }
+    my $path = convert_args($conv_map, $raw_path);
+    my ($service, $section, $name) = parse_path($path, $conv_map);
+    unless ($service and $section and $name) {
+        croakf "invalid 'path', must be :service/:section/:name, but:%s", $raw_path;
+    }
+    my $graph = get_graph($client, $service, $section, $name);
+
+    unless ($graph) {
+        # create actually
+        # check non-optional arguments
+        if (defined $spec->{complex} and $spec->{complex} eq 'true') {
+            return create_complex_actual($client, $conv_map, $service, $section, $name, $spec);
+        } else {
+            my $result = create_basic_actual($client, $conv_map, $service, $section, $name, $spec);
+            return $result if $result; # failed to create graph
+            if (scalar(keys %$spec) > 0) {
+                my $info = get_graph_info($client, $service, $section, $name);
+                return edit_basic_actual($client, $conv_map, $info, $spec);
+            }
+        }
+        return undef; # success
+    }
+    # if exists, check specs and edit(if needed)
+    my $info = get_graph_info($client, $service, $section, $name);
+    unless ($info) {
+        warnf "missing graph info (communication error?): %s", $path;
+        return 1;
+    }
+
+    if (defined $spec->{complex} and $spec->{complex} eq 'true') {
+        return edit_complex_actual($client, $conv_map, $info, $spec);
+    }
+    return edit_basic_actual($client, $conv_map, $info, $spec);
+}
+
+sub edit_basic_actual {
+    my ($client, $conv_map, $info, $spec) = @_;
+
+    my @update_attributes = ();
+
+    foreach my $k (keys %$spec) {
+        if (not defined $info->{$k}) {
+            warnf "Unkown(ignored) basic graph parameter %s for %s/%s/%s", $k, $info->{service}, $info->{section}, $info->{name};
+            next;
+        }
+        if ($k eq 'adjust') { # adjust is arrayref( [adjust, adjustval, unit] ), so specially checked
+            if (scalar(@{$spec->{$k}}) != 3) {
+                warnf "'adjust' of basic graph must be array with 3 values for %s/%s/%s", $info->{service}, $info->{section}, $info->{name};
+                next;
+            }
+            if ($spec->{$k}->[0] ne $info->{$k}->[0] or $spec->{$k}->[1] ne $info->{$k}->[1] or $spec->{$k}->[2] ne $info->{$k}->[2]) {
+                push @update_attributes, $k;
+            }
+            next;
+        } elsif ($k eq 'description') {
+            my $desc = convert_args($conv_map, $spec->{$k});
+            if ($desc ne $info->{$k}) {
+                push @update_attributes, $k;
+            }
+        }
+        # normal attribute
+        if ($spec->{$k} ne $info->{$k}) {
+            push @update_attributes, $k;
+        }
+    }
+    return undef if scalar(@update_attributes) < 1;
+
+    my $update_spec = +{%$info};
+    foreach my $key (@update_attributes) {
+        if ($key eq 'description') {
+            $update_spec->{$key} = convert_args($conv_map, $spec->{$key});
+        } else {
+            $update_spec->{$key} = $spec->{$key};
+        }
+    }
+    my $result = $client->edit_basic_graph($update_spec);
+    unless ($result) {
+        warnf "failed to edit basic graph with spec:%s", $update_spec;
+        return 1;
+    }
+    return undef;
+}
+
+sub edit_complex_actual {
+    my ($client, $conv_map, $info, $spec) = @_;
+
+    my $complex = delete $spec->{complex};
+    my $subgraph_rule = delete $spec->{rule};
+
+    my @update_attributes = ();
+
+    foreach my $k (keys %$spec) {
+        if (not defined $info->{$k}) {
+            warnf "Unknown(ignored) complex graph parameter %s for %s/%s/%s", $k, $info->{service}, $info->{section}, $info->{name};
+            next;
+        }
+        if ($k eq 'series') {
+            my ($specside, $infoside) = ($spec->{series}, $info->{series});
+            if (scalar(@$specside) != scalar(@$infoside)) {
+                push @update_attributes, $k;
+                next;
+            }
+            my $has_diff = 0;
+            for (my $i = 0 ; $i < scalar(@$specside) ; $i++) {
+                my $subinfoside = $infoside->[$i];
+                unless ($specside->[$i]->{path}) {
+                    croakf "FATAL: Sub graph path missing for complex %s/%s/%s", $info->{service}, $info->{section}, $info->{name};
+                }
+                my $subgraph = get_graph($client, parse_path(convert_args($conv_map, $specside->[$i]->{path})));
+                unless ($subgraph) {
+                    croakf "FATAL: Sub graph %s (for %s/%s/%s) doesn't exists!",
+                        $specside->[$i]->{path}, $info->{service}, $info->{section}, $info->{name};
+                }
+                my $subspecside = +{ %$subgraph_rule, %{$specside->[$i]}, id => $subgraph->{id} };
+                unless ($subinfoside->{id} == $subspecside->{id}
+                        and (not defined $subspecside->{type} or $subinfoside->{type} eq $subspecside->{type})
+                        and (not defined $subspecside->{gmode} or $subinfoside->{gmode} eq $subspecside->{gmode})
+                        and (not defined $subspecside->{stack} or $subinfoside->{stack} eq $subspecside->{stack})
+                    ) {
+                    $has_diff = 1;
+                }
+            }
+            if ($has_diff) {
+                push @update_attributes, $k;
+            }
+            next;
+        } elsif ($k eq 'description') {
+            my $desc = convert_args($conv_map, $spec->{description});
+            if ($desc ne $info->{description}) {
+                push @update_attributes, $k;
+            }
+            next;
+        }
+        # normal attribute
+        if ($spec->{$k} ne $info->{$k}) {
+            push @update_attributes, $k;
+        }
+    }
+
+    return undef if scalar(@update_attributes) < 1;
+
+    my $update_spec = +{%$info};
+    foreach my $key (@update_attributes) {
+        if ($key eq 'series') {
+            my $update_series = [];
+            foreach my $s (@{$spec->{series}}) {
+                my $subgraph = get_graph($client, parse_path(convert_args($conv_map, $s->{path})));
+                push @$update_series, +{ %$subgraph_rule, %$s, id => $subgraph->{id} };
+            }
+            $update_spec->{series} = $update_series;
+        } else {
+            $update_spec->{$key} = $spec->{$key};
+        }
+    }
+    my $result = $client->edit_complex_graph($update_spec);
+    unless ($result) {
+        warnf "failed to edit complex graph with spec:%s", $update_spec;
+        return 1;
+    }
+    return undef;
+}
+
+
+my $success = main();
+unless ($success) {
+    exit 1;
+}
+exit 0;

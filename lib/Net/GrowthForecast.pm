@@ -12,6 +12,8 @@ use Try::Tiny;
 
 our $VERSION = '0.01';
 
+#TODO: basic authentication support
+
 sub new {
     my ($this, %opts) = @_;
     my $agent = LWP::UserAgent->new( agent => 'Net::GrowthForecast' );
@@ -114,7 +116,7 @@ sub graphs {
     $d->find('.container section .row div h2 a')
       ->map(sub{
           my $id = $_->attr('data-id');
-          my $complex = $_->attr('href') =~ m!/view_graph/!;
+          my $complex = $_->attr('href') !~ m!/view_graph/!;
           my $name = $_->text;
           return +{ service => $service, section => $section, name => $name, complex => $complex, id => $id };
       });
@@ -195,6 +197,7 @@ sub info_basic_graph {
 
     return +{
         id => $id,
+        complex => 0,
         service => $d->find('input[name=service_name]')->attr('value'),
         section => $d->find('input[name=section_name]')->attr('value'),
         name => $d->find('input[name=graph_name]')->attr('value'),
@@ -305,6 +308,7 @@ sub info_complex_graph {
 
     return +{
         id => $id,
+        complex => 1,
         service => $d->find('input[name=service_name]')->attr('value'),
         section => $d->find('input[name=section_name]')->attr('value'),
         name => $d->find('input[name=graph_name]')->attr('value'),
@@ -323,14 +327,19 @@ sub edit_complex_graph {
     my $post_url = $self->url("/edit_complex/$graph->{id}");
     my ($s1, @s2) = @{$graph->{series}};
     my %series = (
-        'path-1' => $s1->{id}, 'type-1' => $s1->{type}, 'gmode-1' => $s1->{gmode},
-        'path-2' => [],        'type-2' => [],          'gmode-2' => [],           'stack-2' => [],
+        'path-1' => $s1->{id},
+        'type-1' => $s1->{type},
+        'gmode-1' => $s1->{gmode},
+        'path-2' => [],
+        'type-2' => [],
+        'gmode-2' => [],
+        'stack-2' => [],
     );
     foreach my $s2 (@s2) {
         push @{$series{'path-2'}}, $s2->{id};
-        push @{$series{'type-2'}}, $s2->{type};
-        push @{$series{'gmode-2'}}, $s2->{gmode};
-        push @{$series{'stack-2'}}, $s2->{stack};
+        push @{$series{'type-2'}}, $s2->{type} || 'AREA';
+        push @{$series{'gmode-2'}}, (defined($s2->{gmode}) and $s2->{gmode} eq 'subtract') ? 'subtract' : 'gauge';
+        push @{$series{'stack-2'}}, (not $s2->{stack} or $s2->{stack} eq 'false' ? 0 : 1);
     }
     my $res = $self->{agent}->post( $post_url, +{
         service_name => $graph->{service}, section_name => $graph->{section}, graph_name => $graph->{name},
@@ -380,7 +389,7 @@ sub add_complex {
             push @{$args->{'path-2'}}, $r->{id};
             push @{$args->{'type-2'}}, $r->{type} || 'AREA';
             push @{$args->{'gmode-2'}}, (defined($r->{gmode}) and $r->{gmode} eq 'subtract') ? 'subtract' : 'gauge';
-            push @{$args->{'stack-2'}}, defined($r->{stack}) ? $r->{stack} : '1';
+            push @{$args->{'stack-2'}}, (not $r->{stack} or $r->{stack} eq 'false') ? 0 : 1;
         }
     }
 
