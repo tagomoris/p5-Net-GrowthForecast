@@ -5,8 +5,7 @@ all_from 'lib/Net/GrowthForecast.pm';
 readme_from 'lib/Net/GrowthForecast.pm';
 
 requires 'JSON::XS';
-requires 'Web::Query';
-requires 'LWP::UserAgent';
+requires 'Furl';
 
 requires 'Try::Tiny';
 requires 'Log::Minimal';
