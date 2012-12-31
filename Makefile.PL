@@ -12,6 +12,7 @@ requires 'Log::Minimal';
 requires 'List::MoreUtils';
 
 build_requires 'Test::More';
+build_requires 'File::Find::Rule';
 
 tests 't/*.t t/*/*.t';
 # author_tests 'xt';
