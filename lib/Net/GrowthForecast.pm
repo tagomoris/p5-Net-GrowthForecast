@@ -35,17 +35,7 @@ sub new {
     $self;
 }
 
-sub debug {
-    my ($self, $mode) = @_;
-    if (scalar(@_) == 2) {
-        $self->{debug} = $mode ? 1 : 0;
-        return;
-    }
-    # To use like this; $gf->debug->add(...)
-    Net::GrowthForecast->new(%$self, debug => 1);
-}
-
-sub url {
+sub _url {
     my ($self, $path) = @_;
     my $base = 'http://' . $self->{host} . ($self->{port} == 80 ? '' : ':' . $self->{port}) . $self->{prefix};
     $path ||= '/';
@@ -54,7 +44,7 @@ sub url {
 
 sub _request {
     my ($self, $method, $path, $headers, $content) = @_;
-    my $url = $self->url($path);
+    my $url = $self->_url($path);
     my @res;
     my $list = undef;
     if ($method eq 'GET') {
@@ -252,6 +242,16 @@ sub add_complex {
 sub _add_complex { # used from add_complex() and also from add() directly (with spec format argument)
     my ($self, $spec) = @_;
     $self->_request('POST', "/json/create/complex", [], encode_json($spec) );
+}
+
+sub debug {
+    my ($self, $mode) = @_;
+    if (scalar(@_) == 2) {
+        $self->{debug} = $mode ? 1 : 0;
+        return;
+    }
+    # To use like this; $gf->debug->add(...)
+    Net::GrowthForecast->new(%$self, debug => 1);
 }
 
 1;
