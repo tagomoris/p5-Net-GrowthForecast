@@ -294,6 +294,8 @@ Net::GrowthForecast - A client library for awesome visualization tool GrowthFore
 
 Net::GrowthForecast is a client library for GrowthForecast JSON API. This supports GET/LIST/EDIT/ADD/REMOVE simple graphs and complex graphs.
 
+USE GrowthForecast v0.33 or later
+
 =head1 METHODS
 
 =over 4
