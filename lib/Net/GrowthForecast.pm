@@ -265,9 +265,9 @@ Net::GrowthForecast - A client library for awesome visualization tool GrowthFore
 
 =head1 SYNOPSIS
 
-    use GrowthForecast;
+    use Net::GrowthForecast;
 
-    my $gf = GrowthForecast->new( host => 'localhost', port => 5125 );
+    my $gf = Net::GrowthForecast->new( host => 'localhost', port => 5125 );
 
     $gf->post( 'serviceName', 'sectionName', 'graphName', $update_value );
 
