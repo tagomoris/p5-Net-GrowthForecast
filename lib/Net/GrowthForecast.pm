@@ -447,7 +447,7 @@ mode: You should specify $mode at graph creation if you want 'derive' graph.
 
 Returns success or not.
 
-=item $gf->complex( $service, $section, $graph_name, $description, $sumup, $sort, $type, $gmode, $stack, @data_graph_ids )
+=item $gf->add_complex( $service, $section, $graph_name, $description, $sumup, $sort, $type, $gmode, $stack, @data_graph_ids )
 
 Add complex graph with specified options. All arguments are reequired, and type/gmode/stack will used for all sub data graphs. Returns success or not.
 
