@@ -11,7 +11,7 @@ use JSON::XS;
 
 use Try::Tiny;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 #TODO: basic authentication support
 
