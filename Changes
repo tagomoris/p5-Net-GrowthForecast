@@ -1,4 +1,9 @@
 Revision history for Perl module Net::GrowthForecast
 
+{{$NEXT}}
+
+0.02 2014-02-25T07:48:06Z
+   - minil migrate
+
 0.01  Mon Dec 31 14:19:06 JST 2012
    - original version
